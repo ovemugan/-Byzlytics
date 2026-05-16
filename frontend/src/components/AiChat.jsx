@@ -1,6 +1,6 @@
-import { useState, useRef, useEffect } from "react"
-import { Send, Sparkles, Bot, AlertCircle } from "lucide-react"
-import { api } from "../utils/api"
+import { useState, useRef, useEffect, useCallback } from "react"
+import { Send, Sparkles, Bot, AlertCircle, Mic, MicOff } from "lucide-react"
+import { api } from "./api"
 
 const SUGGESTIONS = [
   "Which product makes me the most profit?",
@@ -9,6 +9,50 @@ const SUGGESTIONS = [
   "What was my best month?",
 ]
 
+// ─── Voice Hook ───────────────────────────────────────────────────────────────
+function useVoiceInput(onResult) {
+  const [listening, setListening] = useState(false)
+  const [supported, setSupported] = useState(false)
+  const recognitionRef = useRef(null)
+
+  useEffect(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
+    if (SpeechRecognition) {
+      setSupported(true)
+      const recognition = new SpeechRecognition()
+      recognition.continuous = false
+      recognition.interimResults = true
+      recognition.lang = "en-IN" // Indian English
+
+      recognition.onresult = (event) => {
+        const transcript = Array.from(event.results)
+          .map(r => r[0].transcript)
+          .join("")
+        onResult(transcript, event.results[event.results.length - 1].isFinal)
+      }
+
+      recognition.onend = () => setListening(false)
+      recognition.onerror = () => setListening(false)
+
+      recognitionRef.current = recognition
+    }
+  }, [onResult])
+
+  const toggle = useCallback(() => {
+    if (!recognitionRef.current) return
+    if (listening) {
+      recognitionRef.current.stop()
+      setListening(false)
+    } else {
+      recognitionRef.current.start()
+      setListening(true)
+    }
+  }, [listening])
+
+  return { listening, supported, toggle }
+}
+
+// ─── Components ───────────────────────────────────────────────────────────────
 function Message({ msg }) {
   const isUser = msg.role === "user"
   return (
@@ -45,6 +89,28 @@ function TypingIndicator() {
   )
 }
 
+// ─── Voice Button ─────────────────────────────────────────────────────────────
+function VoiceButton({ listening, supported, onToggle }) {
+  if (!supported) return null
+  return (
+    <button
+      onClick={onToggle}
+      title={listening ? "Stop listening" : "Voice input"}
+      className={`w-9 h-9 rounded-lg flex items-center justify-center transition-all self-end ${
+        listening
+          ? "bg-red-500 hover:bg-red-400 animate-pulse"
+          : "bg-white/10 hover:bg-white/20"
+      }`}
+    >
+      {listening
+        ? <MicOff size={14} className="text-white" />
+        : <Mic size={14} className="text-white/60" />
+      }
+    </button>
+  )
+}
+
+// ─── Main Component ───────────────────────────────────────────────────────────
 export default function AiChat({ stockInput, setStockInput, provider = "gemini" }) {
   const [messages, setMessages] = useState([{
     role: "assistant",
@@ -54,6 +120,20 @@ export default function AiChat({ stockInput, setStockInput, provider = "gemini" 
   const [loading, setLoading] = useState(false)
   const [error,   setError]   = useState(null)
   const bottomRef = useRef()
+
+  // Voice callback - update input as user speaks
+  const handleVoiceResult = useCallback((transcript, isFinal) => {
+    setInput(transcript)
+    if (isFinal && transcript.trim()) {
+      // Auto-send on final result after brief delay
+      setTimeout(() => {
+        handleSend(transcript)
+        setInput("")
+      }, 300)
+    }
+  }, [])
+
+  const { listening, supported, toggle: toggleVoice } = useVoiceInput(handleVoiceResult)
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }) }, [messages, loading])
 
@@ -72,7 +152,7 @@ export default function AiChat({ stockInput, setStockInput, provider = "gemini" 
 
     try {
       const isStock = /\b(add|restock|received|got)\b.*\d+/i.test(message)
-      
+
       let reply
       if (isStock) {
         const res = await api.addStock(message)
@@ -88,7 +168,7 @@ export default function AiChat({ stockInput, setStockInput, provider = "gemini" 
       setError(errorMsg)
       setMessages(prev => [...prev, {
         role: "assistant",
-        content: errorMsg.includes("API key") 
+        content: errorMsg.includes("API key")
           ? "⚠️ Please add your API key in Settings first to use this feature."
           : `Sorry, I had trouble: ${errorMsg}`,
       }])
@@ -108,12 +188,20 @@ export default function AiChat({ stockInput, setStockInput, provider = "gemini" 
             {provider === "groq" ? "⚡ Groq" : "🔵 Gemini"}
           </p>
           <p className="text-white/30 text-xs">
-            {provider === "groq" 
+            {provider === "groq"
               ? "Ultra-fast AI · Lightning quick responses"
               : "Google AI · Creative & detailed"
             }
           </p>
         </div>
+        {supported && (
+          <div className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs ${
+            listening ? "bg-red-500/20 text-red-400" : "text-white/30"
+          }`}>
+            {listening && <span className="w-1.5 h-1.5 rounded-full bg-red-400 animate-pulse" />}
+            {listening ? "Listening..." : "Voice ready"}
+          </div>
+        )}
       </div>
 
       <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-4">
@@ -141,21 +229,28 @@ export default function AiChat({ stockInput, setStockInput, provider = "gemini" 
       )}
 
       <div className="px-4 pb-4">
-        <div className="flex gap-2 bg-white/[0.04] rounded-xl border border-white/[0.08] focus-within:border-[#f5c842]/30 transition-colors p-2">
+        <div className={`flex gap-2 bg-white/[0.04] rounded-xl border transition-colors p-2 ${
+          listening ? "border-red-400/40" : "border-white/[0.08] focus-within:border-[#f5c842]/30"
+        }`}>
           <textarea
             value={input}
             onChange={e => setInput(e.target.value)}
             onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend() } }}
             rows={2}
-            placeholder='Ask anything... or "add 200 units of Rice"'
+            placeholder={listening ? "🎤 Listening... speak now" : 'Ask anything... or "add 200 units of Rice"'}
             className="flex-1 bg-transparent text-sm text-white/80 placeholder-white/20 resize-none outline-none px-2 py-1"
           />
-          <button onClick={() => handleSend()} disabled={!input.trim() || loading}
-            className="w-9 h-9 bg-[#f5c842] hover:bg-[#e8b832] disabled:opacity-40 disabled:cursor-not-allowed rounded-lg flex items-center justify-center transition-colors self-end">
-            <Send size={14} className="text-black" />
-          </button>
+          <div className="flex flex-col gap-1 self-end">
+            <VoiceButton listening={listening} supported={supported} onToggle={toggleVoice} />
+            <button onClick={() => handleSend()} disabled={!input.trim() || loading}
+              className="w-9 h-9 bg-[#f5c842] hover:bg-[#e8b832] disabled:opacity-40 disabled:cursor-not-allowed rounded-lg flex items-center justify-center transition-colors">
+              <Send size={14} className="text-black" />
+            </button>
+          </div>
         </div>
-        <p className="text-white/20 text-xs mt-1.5 px-2">Enter to send · Shift+Enter for new line</p>
+        <p className="text-white/20 text-xs mt-1.5 px-2">
+          Enter to send · Shift+Enter for new line{supported ? " · 🎤 mic for voice" : ""}
+        </p>
       </div>
     </div>
   )

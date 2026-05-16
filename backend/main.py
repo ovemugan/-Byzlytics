@@ -4,7 +4,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr
 from typing import Optional
 import pandas as pd
-import io, os, re
+import io, os, re, base64
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
@@ -29,6 +29,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # ─── MongoDB ──────────────────────────────────────────────────────────────────
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 DB_NAME     = os.getenv("DB_NAME", "byzlytics")
@@ -59,7 +60,7 @@ class UserLogin(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
-    provider: Optional[str] = "gemini"  # "gemini" or "groq"
+    provider: Optional[str] = "gemini"
 
 class StockRequest(BaseModel):
     message: str
@@ -68,11 +69,9 @@ class ApiKeyUpdate(BaseModel):
     provider: str  # "gemini" or "groq"
     api_key: str
 
-class UserProfile(BaseModel):
-    name: str
-    email: str
-    gemini_api_key: Optional[str] = None
-    groq_api_key: Optional[str] = None
+class BillImageRequest(BaseModel):
+    image_base64: str  # base64 encoded image
+    mime_type: Optional[str] = "image/jpeg"
 
 # ─── Auth helpers ─────────────────────────────────────────────────────────────
 def hash_password(password: str) -> str:
@@ -144,16 +143,29 @@ async def call_gemini(api_key: str, prompt: str) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gemini error: {str(e)}")
 
+async def call_gemini_vision(api_key: str, image_bytes: bytes, mime_type: str, prompt: str) -> str:
+    """Call Gemini with image for bill parsing."""
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        image_part = {"mime_type": mime_type, "data": image_bytes}
+        response = model.generate_content([prompt, image_part])
+        return response.text
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gemini Vision error: {str(e)}")
+
 async def call_groq(api_key: str, prompt: str) -> str:
+    """Call Groq using correct OpenAI-compatible SDK."""
     try:
         from groq import Groq
-        client = Groq(api_key=api_key)
-        message = client.messages.create(
+        groq_client = Groq(api_key=api_key)
+        completion = groq_client.chat.completions.create(
             model="mixtral-8x7b-32768",
             max_tokens=1024,
             messages=[{"role": "user", "content": prompt}]
         )
-        return message.content[0].text
+        return completion.choices[0].message.content
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Groq error: {str(e)}")
 
@@ -177,7 +189,7 @@ async def register(body: UserRegister):
         "groq_api_key": None,
         "created_at": datetime.utcnow(),
     }
-    result = await users_col.insert_one(user)
+    await users_col.insert_one(user)
     token = create_token({"sub": body.email})
     return {"token": token, "name": body.name, "email": body.email}
 
@@ -239,7 +251,6 @@ async def upload_csv(
     df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%dT%H:%M:%S")
 
     user_email = current_user["email"]
-
     await sales_col.delete_many({"user_email": user_email})
 
     records = df.to_dict(orient="records")
@@ -255,6 +266,107 @@ async def upload_csv(
         "columns": list(df.columns),
         "filename": file.filename,
     }
+
+# ─── ROUTE: Upload Bill Image (Camera/Gallery) ────────────────────────────────
+@app.post("/upload-bill-image")
+async def upload_bill_image(
+    body: BillImageRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Accept base64 bill image, use Gemini Vision to extract product/purchase data,
+    then insert into sales collection.
+    """
+    api_key = current_user.get("gemini_api_key", "")
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Gemini API key required for bill scanning. Add it in Settings."
+        )
+
+    # Decode base64
+    try:
+        # Strip data URL prefix if present (e.g. "data:image/jpeg;base64,...")
+        image_data = body.image_base64
+        if "," in image_data:
+            image_data = image_data.split(",", 1)[1]
+        image_bytes = base64.b64decode(image_data)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 image data")
+
+    prompt = """You are a bill/receipt parser for an Indian small business inventory system.
+
+Analyze this bill/receipt image and extract all purchased products.
+
+Return ONLY a valid JSON array (no markdown, no explanation) in this exact format:
+[
+  {
+    "date": "YYYY-MM-DD",
+    "product": "Product Name",
+    "category": "Category",
+    "quantity_sold": 0,
+    "unit_price": 0,
+    "unit_cost": 0,
+    "stock_remaining": 100
+  }
+]
+
+Rules:
+- date: use today's date if not visible (""" + datetime.utcnow().strftime("%Y-%m-%d") + """)
+- product: clean product name
+- category: guess from product (Groceries/Stationery/Electronics/Clothing/Food/Other)
+- quantity_sold: items purchased (use as quantity bought, set to 0 if purchase bill)
+- unit_price: selling price per unit (estimate 20-30% markup over cost if not shown)
+- unit_cost: purchase/cost price per unit
+- stock_remaining: set to quantity purchased (since this is new stock)
+- All prices in INR numbers only (no ₹ symbol)
+
+If image is not a bill or unclear, return: []
+"""
+
+    try:
+        result_text = await call_gemini_vision(api_key, image_bytes, body.mime_type, prompt)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Vision error: {str(e)}")
+
+    # Parse JSON from response
+    try:
+        # Clean up response - remove markdown if present
+        clean = result_text.strip()
+        if clean.startswith("```"):
+            clean = re.sub(r"```(?:json)?", "", clean).strip().rstrip("`").strip()
+
+        import json
+        records = json.loads(clean)
+
+        if not isinstance(records, list) or len(records) == 0:
+            return {"message": "No products found in image. Try a clearer photo of the bill.", "rows": 0}
+
+        # Insert into DB
+        user_email = current_user["email"]
+        for r in records:
+            r["user_email"] = user_email
+            r["date"] = r.get("date", datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S"))
+            # Ensure numeric types
+            r["quantity_sold"] = int(r.get("quantity_sold", 0))
+            r["unit_price"] = float(r.get("unit_price", 0))
+            r["unit_cost"] = float(r.get("unit_cost", 0))
+            r["stock_remaining"] = int(r.get("stock_remaining", 0))
+
+        await sales_col.insert_many(records)
+
+        product_names = [r["product"] for r in records]
+        return {
+            "message": f"Added {len(records)} product(s) from bill: {', '.join(product_names)}",
+            "rows": len(records),
+            "products": product_names,
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to parse bill data: {str(e)}. Raw response: {result_text[:200]}"
+        )
 
 # ─── ROUTE: Reports ───────────────────────────────────────────────────────────
 @app.get("/reports")
@@ -326,7 +438,6 @@ async def chat(req: ChatRequest, current_user: dict = Depends(get_current_user))
     if provider not in ["gemini", "groq"]:
         provider = "gemini"
 
-    # Get user's API key for the chosen provider
     api_key_field = f"{provider}_api_key"
     api_key = current_user.get(api_key_field, "")
 
@@ -357,7 +468,7 @@ Rules:
     try:
         if provider == "gemini":
             reply = await call_gemini(api_key, prompt)
-        else:  # groq
+        else:
             reply = await call_groq(api_key, prompt)
         return {"reply": reply}
     except Exception as e:

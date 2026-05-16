@@ -75,6 +75,19 @@ export const api = {
     return res.json()
   },
 
+  async uploadBillImage(imageBase64, mimeType = "image/jpeg") {
+    const res = await fetch(`${BASE}/upload-bill-image`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ image_base64: imageBase64, mime_type: mimeType }),
+    })
+    if (!res.ok) {
+      const err = await res.json()
+      throw new Error(err.detail || "Bill scan failed")
+    }
+    return res.json()
+  },
+
   async getReports() {
     const res = await fetch(`${BASE}/reports`, { headers: authHeaders() })
     if (!res.ok) throw new Error("Failed to load reports")
